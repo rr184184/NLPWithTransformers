@@ -5,15 +5,18 @@ from datasets import list_datasets, load_from_disk
 from datasets import load_dataset
 import torch
 import torch.nn.functional as F
+from numpy.ma.extras import average
 from torch.xpu import device
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+from transformers import Trainer, TrainingArguments
 import time
 import numpy as np
 from umap import UMAP
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.dummy import DummyClassifier
-from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix, accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 
 def explore_huggingface_datasets():
     all_datasets = list_datasets()
@@ -365,6 +368,92 @@ def training_using_feature_extractor():
     y_preds = lr_clf.predict(X_valid)
     plot_confusion_matrix(y_preds, y_valid, labels)
 
+"""
+Fine-Tuning Transformers
+We explore the fine-tuning approach, which leads to superior classification
+performance. It is, however, important to note that doing this requires more
+computational resources, such as GPUs, that might not be available in your
+organization. In cases like these, a feature-based approach can be a good
+compromise between doing traditional machine learning and deep learning.
+What does it take to fine-tune a transformer end-to-end?
+With the fine-tuning approach we do not use the hidden states as fixed
+features, but instead train them.
+Training the hidden states that serve as inputs to the classification model
+will help us avoid the problem of working with data that may not be well suited
+for the classification task. Instead, the initial hidden states adapt during
+training to decrease the model loss and thus increase its performance.
+"""
+
+"""
+To monitor metrics during training, we need to define a compute_metrics()
+function for the Trainer. This function receives an EvalPrediction object
+(which is a named tuple with predictions and label_ids attributes) and needs
+to return a dictionary that maps each metric’s name to its value. For our
+application, we’ll compute the F1-score and the accuracy of the model.
+"""
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    f1 = f1_score(labels, preds, average="weighted")
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc, "f1": f1}
+
+def training_using_fine_tuning():
+    """
+    The first thing we need is a pretrained DistilBERT model like the one we
+    used in the feature-based approach. The only slight modification is that
+    we use the AutoModelForSequenceClassification model instead of AutoModel.
+    The difference is that the AutoModelForSequenceClassification model has a
+    classification head on top of the pretrained model outputs, which can be
+    easily trained with the base model. We just need to specify how many labels
+    the model has to predict (six in our case), since this dictates the number
+    of outputs the classification head has.
+    """
+    num_labels = 6
+    modelSeqClassification = (AutoModelForSequenceClassification
+                              .from_pretrained(model_ckpt, num_labels=num_labels)
+                              .to(device))
+    """
+    You see a warning that some parts of the model are randomly initialized:
+    'Some weights of DistilBertForSequenceClassification were not initialized
+    from the model checkpoint at distilbert-base-uncased and are newly initialized:
+    ['classifier.bias', 'classifier.weight', 'pre_classifier.bias', 'pre_classifier.weight']
+    You should probably TRAIN this model on a down-stream task to be able to
+    use it for predictions and inference.'
+    This is normal since the classification head has not yet been trained.
+    The next step is to define the metrics that we’ll use to evaluate our
+    model’s performance during fine-tuning.
+    """
+    print(f"obtained the model for sequence classification:\n{modelSeqClassification}\n")
+    # start the training
+    batch_size = 64
+
+    emotions_encoded = tokenize_entire_dataset()
+    print(f"emotions_encoded['train'].column_names: ${emotions_encoded['train'].column_names}")
+    print(f"emotions_encoded['validation'].column_names: ${emotions_encoded['validation'].column_names}")
+
+    logging_steps = len(emotions_encoded["train"]) # batch_size
+    model_name = f"{model_ckpt}-finetuned-emotion"
+    training_args = TrainingArguments(output_dir=model_name,
+                                      num_train_epochs=2,
+                                      learning_rate=2e-5,
+                                      per_device_train_batch_size=batch_size,
+                                      per_device_eval_batch_size=batch_size,
+                                      weight_decay=0.01,
+                                      evaluation_strategy="epoch",
+                                      disable_tqdm=False,
+                                      logging_steps=logging_steps,
+                                      push_to_hub=False,
+                                      log_level="error")
+    trainer = Trainer(model=model,
+                      args=training_args,
+                      compute_metrics=compute_metrics,
+                      train_dataset=emotions_encoded["train"],
+                      eval_dataset=emotions_encoded["validation"],
+                      tokenizer=tokenizer)
+    # training_stats = trainer.train()
+    # print(f"fine tuning training_stats:\n{training_stats}\n")
+
 def main():
     print("starting text_classification...\n")
     # explore_huggingface_datasets()
@@ -373,7 +462,8 @@ def main():
     # tokenize_to_characters()
     # tokenize_to_words()
     # tokenize_entire_dataset()
-    training_using_feature_extractor()
+    # training_using_feature_extractor()
+    training_using_fine_tuning()
 
 if __name__ == '__main__':
     main()
